@@ -17,6 +17,7 @@ import kotlinx.coroutines.launch
 import java.io.FileInputStream
 import java.io.FileOutputStream
 import java.net.InetAddress
+import java.net.InetSocketAddress
 import java.nio.ByteBuffer
 import java.nio.channels.DatagramChannel
 import java.nio.channels.Selector
@@ -112,7 +113,7 @@ class GhostVpnService : VpnService() {
         val selector = Selector.open()
         val udpChannel = DatagramChannel.open().apply {
             configureBlocking(false)
-            connect(InetAddress.getByName("8.8.8.8"), 53)
+            connect(InetSocketAddress(InetAddress.getByName("8.8.8.8"), 53))
             protect(socket())
         }
 
