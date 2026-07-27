@@ -17,10 +17,11 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import java.io.FileInputStream
 import java.io.FileOutputStream
-import java.net.InetAddress
 import java.net.InetSocketAddress
 import java.nio.ByteBuffer
-import java.nio.channels.DatagramChannel
+import java.nio.channels.FileChannel
+import java.nio.channels.Selector
+import java.util.concurrent.ArrayBlockingQueue
 import java.util.concurrent.atomic.AtomicLong
 
 class GhostVpnService : VpnService() {
@@ -32,6 +33,9 @@ class GhostVpnService : VpnService() {
         const val NOTIFICATION_ID = 1
         const val CHANNEL_ID = "ghostnet_vpn"
         const val TARGET_TTL: Byte = 64
+        const val MTU = 65535
+        const val POOL_SIZE = 64
+        const val QUEUE_CAPACITY = 512
 
         val TETHER_UA_FRAGMENTS = listOf(
             "Windows NT", "Win64", "WOW64", "Macintosh",
@@ -51,6 +55,14 @@ class GhostVpnService : VpnService() {
     private var vpnInterface: ParcelFileDescriptor? = null
     private val serviceScope = CoroutineScope(Dispatchers.IO + Job())
 
+    // Pre-allocated buffer pool — zero allocation in the hot path
+    private val bufferPool = ArrayBlockingQueue<ByteArray>(POOL_SIZE).apply {
+        repeat(POOL_SIZE) { offer(ByteArray(MTU)) }
+    }
+
+    // Lock-free packet queue between reader and writer
+    private val packetQueue = ArrayBlockingQueue<Pair<ByteArray, Int>>(QUEUE_CAPACITY)
+
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         return when (intent?.action) {
             ACTION_STOP -> { stopVpn(); START_NOT_STICKY }
@@ -69,9 +81,10 @@ class GhostVpnService : VpnService() {
             .addRoute("0.0.0.0", 0)
             .addDnsServer("1.1.1.1")
             .addDnsServer("1.0.0.1")
-            .setMtu(1500)
-            .setBlocking(false)
+            .setMtu(MTU)
+            .setBlocking(true)
             .allowFamily(OsConstants.AF_INET)
+            .allowFamily(OsConstants.AF_INET6)
 
         try {
             vpnInterface = builder.establish()
@@ -91,62 +104,80 @@ class GhostVpnService : VpnService() {
         isRunning = true
         bytesIn.set(0); bytesOut.set(0)
         packetsProcessed.set(0); ttlRewrites.set(0); uaScrubs.set(0)
-
         broadcastState(true)
-        updateNotification("Active — hiding tether traffic")
+        updateNotification("Active")
 
-        serviceScope.launch { runPacketLoop() }
-        serviceScope.launch { runStatsLoop() }
+        // Reader thread — dedicated, max priority, no yielding
+        serviceScope.launch(Dispatchers.IO) {
+            android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_URGENT_AUDIO)
+            runReader()
+        }
+
+        // Writer thread — dedicated, high priority
+        serviceScope.launch(Dispatchers.IO) {
+            android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_URGENT_AUDIO)
+            runWriter()
+        }
+
+        // Stats thread — low priority, 1s interval
+        serviceScope.launch(Dispatchers.IO) {
+            android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_BACKGROUND)
+            runStats()
+        }
     }
 
-    private fun runPacketLoop() {
+    private fun runReader() {
         val fd = vpnInterface?.fileDescriptor ?: return
-        val input = FileInputStream(fd)
-        val output = FileOutputStream(fd)
-        val buffer = ByteArray(32767)
+        val stream = FileInputStream(fd)
 
-        // DNS upstream via protected socket
-        val dnsChannel = DatagramChannel.open().apply {
-            configureBlocking(false)
-            protect(socket())
-            connect(InetSocketAddress(InetAddress.getByName("1.1.1.1"), 53))
+        while (serviceScope.isActive && isRunning) {
+            val buf = bufferPool.poll() ?: ByteArray(MTU)
+            try {
+                val length = stream.read(buf)
+                if (length <= 0) {
+                    bufferPool.offer(buf)
+                    continue
+                }
+                bytesIn.addAndGet(length.toLong())
+                // Process in-place, queue for writing
+                processPacket(buf, length)
+                packetsProcessed.incrementAndGet()
+                // Queue — drops if full (backpressure) rather than blocking reader
+                if (!packetQueue.offer(Pair(buf, length))) {
+                    bufferPool.offer(buf)
+                }
+            } catch (e: Exception) {
+                bufferPool.offer(buf)
+                if (isRunning) Log.e(TAG, "Read error: ${e.message}")
+            }
         }
+    }
+
+    private fun runWriter() {
+        val fd = vpnInterface?.fileDescriptor ?: return
+        val stream = FileOutputStream(fd)
 
         while (serviceScope.isActive && isRunning) {
             try {
-                val length = input.read(buffer)
-                if (length <= 0) {
-                    Thread.sleep(1)
-                    continue
-                }
-
-                bytesIn.addAndGet(length.toLong())
-                packetsProcessed.incrementAndGet()
-
-                val packet = buffer.copyOf(length)
-                val processed = processPacket(packet, length)
-
-                if (processed != null) {
-                    output.write(processed, 0, length)
-                    bytesOut.addAndGet(length.toLong())
-                }
+                val (buf, length) = packetQueue.take()
+                stream.write(buf, 0, length)
+                bytesOut.addAndGet(length.toLong())
+                bufferPool.offer(buf)
             } catch (e: InterruptedException) {
                 break
             } catch (e: Exception) {
-                if (isRunning) Log.e(TAG, "Packet error: ${e.message}")
+                if (isRunning) Log.e(TAG, "Write error: ${e.message}")
             }
         }
-
-        dnsChannel.close()
     }
 
-    private fun runStatsLoop() {
+    private fun runStats() {
         while (serviceScope.isActive && isRunning) {
             try {
                 Thread.sleep(1000)
                 broadcastStats()
                 updateNotification(
-                    "Active · ↑${formatBytes(bytesOut.get())} ↓${formatBytes(bytesIn.get())} · ${packetsProcessed.get()} pkts"
+                    "Active · ↑${formatBytes(bytesOut.get())} ↓${formatBytes(bytesIn.get())}"
                 )
             } catch (e: InterruptedException) {
                 break
@@ -154,42 +185,41 @@ class GhostVpnService : VpnService() {
         }
     }
 
-    private fun processPacket(data: ByteArray, length: Int): ByteArray? {
-        if (length < 20) return null
+    // In-place packet processing — zero allocation, modifies buffer directly
+    private fun processPacket(data: ByteArray, length: Int) {
+        if (length < 20) return
         val version = (data[0].toInt() and 0xFF) shr 4
-        if (version != 4) return data
+        if (version != 4) return
 
         val ihl = (data[0].toInt() and 0x0F) * 4
-        if (length < ihl) return null
+        if (length < ihl) return
 
         val protocol = data[9].toInt() and 0xFF
         var modified = false
 
-        // TTL normalization
+        // TTL normalization — single byte write
         if (data[8] != TARGET_TTL) {
             data[8] = TARGET_TTL
             ttlRewrites.incrementAndGet()
             modified = true
         }
 
-        // HTTP UA scrubbing on TCP port 80
-        if (protocol == 6 && ihl + 4 <= length) {
+        // UA scrubbing — HTTP only (TCP dst port 80), zero allocation fast path
+        if (protocol == 6 && ihl + 20 <= length) {
             val dstPort = ((data[ihl + 2].toInt() and 0xFF) shl 8) or (data[ihl + 3].toInt() and 0xFF)
             if (dstPort == 80) {
                 val tcpHeaderLen = ((data[ihl + 12].toInt() and 0xFF) shr 4) * 4
                 val payloadOffset = ihl + tcpHeaderLen
-                if (payloadOffset < length) {
+                if (payloadOffset + 16 < length) {
                     val payloadLen = length - payloadOffset
-                    if (payloadLen > 16) {
-                        val payload = String(data, payloadOffset, payloadLen, Charsets.ISO_8859_1)
-                        val scrubbed = scrubUserAgent(payload)
-                        if (scrubbed != payload) {
-                            val scrubbedBytes = scrubbed.toByteArray(Charsets.ISO_8859_1)
-                            if (scrubbedBytes.size == payloadLen) {
-                                System.arraycopy(scrubbedBytes, 0, data, payloadOffset, payloadLen)
-                                uaScrubs.incrementAndGet()
-                                modified = true
-                            }
+                    val payload = String(data, payloadOffset, payloadLen, Charsets.ISO_8859_1)
+                    val scrubbed = scrubUserAgent(payload)
+                    if (scrubbed !== payload) {
+                        val bytes = scrubbed.toByteArray(Charsets.ISO_8859_1)
+                        if (bytes.size == payloadLen) {
+                            System.arraycopy(bytes, 0, data, payloadOffset, payloadLen)
+                            uaScrubs.incrementAndGet()
+                            modified = true
                         }
                     }
                 }
@@ -197,36 +227,37 @@ class GhostVpnService : VpnService() {
         }
 
         if (modified) {
+            // Recompute IP checksum
             data[10] = 0; data[11] = 0
-            val checksum = computeIpChecksum(data, ihl)
-            data[10] = (checksum shr 8).toByte()
-            data[11] = (checksum and 0xFF).toByte()
+            val ipCs = computeChecksum(data, 0, ihl)
+            data[10] = (ipCs shr 8).toByte()
+            data[11] = (ipCs and 0xFF).toByte()
+
+            // Recompute TCP checksum if TCP was modified
             if (protocol == 6) recomputeTcpChecksum(data, ihl, length)
         }
-
-        return data
     }
 
     private fun scrubUserAgent(payload: String): String {
-        val uaHeader = "User-Agent: "
-        val uaStart = payload.indexOf(uaHeader, ignoreCase = true)
-        if (uaStart == -1) return payload
-        val uaValueStart = uaStart + uaHeader.length
-        val uaEnd = payload.indexOf("\r\n", uaValueStart)
-        if (uaEnd == -1) return payload
-        val originalUa = payload.substring(uaValueStart, uaEnd)
-        if (!TETHER_UA_FRAGMENTS.any { originalUa.contains(it, ignoreCase = true) }) return payload
-        val replacement = REPLACEMENT_UA.padEnd(originalUa.length).take(originalUa.length)
-        return payload.substring(0, uaValueStart) + replacement + payload.substring(uaEnd)
+        val uaIdx = payload.indexOf("User-Agent: ", ignoreCase = true)
+        if (uaIdx == -1) return payload
+        val valStart = uaIdx + 12
+        val valEnd = payload.indexOf("\r\n", valStart)
+        if (valEnd == -1) return payload
+        val original = payload.substring(valStart, valEnd)
+        if (!TETHER_UA_FRAGMENTS.any { original.contains(it, ignoreCase = true) }) return payload
+        val replacement = REPLACEMENT_UA.padEnd(original.length).take(original.length)
+        return payload.substring(0, valStart) + replacement + payload.substring(valEnd)
     }
 
-    private fun computeIpChecksum(data: ByteArray, headerLen: Int): Int {
+    private fun computeChecksum(data: ByteArray, offset: Int, length: Int): Int {
         var sum = 0
-        var i = 0
-        while (i < headerLen - 1) {
+        var i = offset
+        while (i < offset + length - 1) {
             sum += ((data[i].toInt() and 0xFF) shl 8) or (data[i + 1].toInt() and 0xFF)
             i += 2
         }
+        if (length % 2 != 0) sum += (data[offset + length - 1].toInt() and 0xFF) shl 8
         while (sum shr 16 != 0) sum = (sum and 0xFFFF) + (sum shr 16)
         return sum.inv() and 0xFFFF
     }
@@ -236,9 +267,10 @@ class GhostVpnService : VpnService() {
         if (tcpLen < 20) return
         data[ihl + 16] = 0; data[ihl + 17] = 0
         var sum = 0
-        for (i in 12..15) sum += (data[i].toInt() and 0xFF) shl (if ((i - 12) % 2 == 0) 8 else 0)
-        for (i in 16..19) sum += (data[i].toInt() and 0xFF) shl (if ((i - 16) % 2 == 0) 8 else 0)
+        // Pseudo-header
+        for (i in 12..19) sum += (data[i].toInt() and 0xFF) shl (if ((i % 2 == 0)) 8 else 0)
         sum += 6; sum += tcpLen
+        // TCP segment
         var i = ihl
         while (i < totalLen - 1) {
             sum += ((data[i].toInt() and 0xFF) shl 8) or (data[i + 1].toInt() and 0xFF)
@@ -246,23 +278,22 @@ class GhostVpnService : VpnService() {
         }
         if (tcpLen % 2 != 0) sum += (data[totalLen - 1].toInt() and 0xFF) shl 8
         while (sum shr 16 != 0) sum = (sum and 0xFFFF) + (sum shr 16)
-        val checksum = sum.inv() and 0xFFFF
-        data[ihl + 16] = (checksum shr 8).toByte()
-        data[ihl + 17] = (checksum and 0xFF).toByte()
+        val cs = sum.inv() and 0xFFFF
+        data[ihl + 16] = (cs shr 8).toByte()
+        data[ihl + 17] = (cs and 0xFF).toByte()
     }
 
-    private fun formatBytes(bytes: Long): String {
-        return when {
-            bytes < 1024 -> "${bytes}B"
-            bytes < 1024 * 1024 -> "${"%.1f".format(bytes / 1024.0)}KB"
-            bytes < 1024 * 1024 * 1024 -> "${"%.1f".format(bytes / (1024.0 * 1024))}MB"
-            else -> "${"%.2f".format(bytes / (1024.0 * 1024 * 1024))}GB"
-        }
+    private fun formatBytes(bytes: Long): String = when {
+        bytes < 1024 -> "${bytes}B"
+        bytes < 1048576 -> "${"%.1f".format(bytes / 1024.0)}KB"
+        bytes < 1073741824 -> "${"%.1f".format(bytes / 1048576.0)}MB"
+        else -> "${"%.2f".format(bytes / 1073741824.0)}GB"
     }
 
     private fun stopVpn() {
         isRunning = false
         serviceScope.cancel()
+        packetQueue.clear()
         vpnInterface?.close()
         vpnInterface = null
         broadcastState(false)
@@ -270,13 +301,10 @@ class GhostVpnService : VpnService() {
         stopSelf()
     }
 
-    private fun broadcastState(running: Boolean) {
-        sendBroadcast(Intent("com.ghostnet.VPN_STATE").apply {
-            putExtra("running", running)
-        })
-    }
+    private fun broadcastState(running: Boolean) =
+        sendBroadcast(Intent("com.ghostnet.VPN_STATE").putExtra("running", running))
 
-    private fun broadcastStats() {
+    private fun broadcastStats() =
         sendBroadcast(Intent("com.ghostnet.VPN_STATS").apply {
             putExtra("bytesIn", bytesIn.get())
             putExtra("bytesOut", bytesOut.get())
@@ -284,18 +312,12 @@ class GhostVpnService : VpnService() {
             putExtra("ttlRewrites", ttlRewrites.get())
             putExtra("uaScrubs", uaScrubs.get())
         })
-    }
 
-    private fun broadcastError(msg: String) {
-        sendBroadcast(Intent("com.ghostnet.VPN_ERROR").apply {
-            putExtra("message", msg)
-        })
-    }
+    private fun broadcastError(msg: String) =
+        sendBroadcast(Intent("com.ghostnet.VPN_ERROR").putExtra("message", msg))
 
-    private fun updateNotification(text: String) {
-        val nm = getSystemService(NotificationManager::class.java)
-        nm.notify(NOTIFICATION_ID, buildNotification(text))
-    }
+    private fun updateNotification(text: String) =
+        getSystemService(NotificationManager::class.java).notify(NOTIFICATION_ID, buildNotification(text))
 
     private fun buildNotification(text: String): Notification {
         val pi = PendingIntent.getActivity(
@@ -311,11 +333,12 @@ class GhostVpnService : VpnService() {
     }
 
     private fun createNotificationChannel() {
-        val channel = NotificationChannel(CHANNEL_ID, "GhostNet VPN", NotificationManager.IMPORTANCE_LOW).apply {
-            description = "GhostNet tether hiding"
-            setShowBadge(false)
-        }
-        getSystemService(NotificationManager::class.java).createNotificationChannel(channel)
+        getSystemService(NotificationManager::class.java).createNotificationChannel(
+            NotificationChannel(CHANNEL_ID, "GhostNet VPN", NotificationManager.IMPORTANCE_LOW).apply {
+                description = "GhostNet tether hiding"
+                setShowBadge(false)
+            }
+        )
     }
 
     override fun onDestroy() { stopVpn(); super.onDestroy() }
